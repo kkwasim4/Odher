@@ -1,0 +1,291 @@
+// OdherExplorer - Replit-ready Node.js agent (single-file example + supporting files)
+// Files included below (copy each into separate files in your Replit project):
+// 1) package.json
+// 2) .env.example
+// 3) server.js   <- main server + worker + simple cache
+// 4) README.md
+
+// ---------------------------
+// 1) package.json
+// ---------------------------
+{
+  "name": "odherexplorer-agent",
+  "version": "1.0.0",
+  "description": "Token Data Fusion agent for OdherExplorer (Alchemy + CoinGecko) - ready for Replit",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "dotenv": "^16.0.0",
+    "ethers": "^5.7.2",
+    "express": "^4.18.2",
+    "lowdb": "^6.0.1",
+    "nanoid": "^4.0.0"
+  }
+}
+
+
+// ---------------------------
+// 2) .env.example
+// ---------------------------
+// Copy to .env and fill values before running
+// ALCHEMY_API_KEY=your-alchemy-api-key
+// PROVIDER_NETWORK=homestead   # e.g. homestead, goerli, sepolia
+// PORT=3000
+// HOLDER_INDEX_BLOCK_RANGE=100000   # blocks to scan back for Transfer events (approx)
+
+
+// ---------------------------
+// 3) server.js
+// ---------------------------
+
+/*
+  What this agent does (minimal, copy-paste to Replit):
+  - Exposes GET /api/token/:contractAddress
+  - Fetches on-chain token info (name, symbol, totalSupply, decimals) via ethers + Alchemy provider
+  - Attempts to fetch holders count by scanning recent Transfer events (configurable block range)
+  - Fetches CoinGecko token info for circulatingSupply, logo, price, marketcap (if CoinGecko has the contract)
+  - Merges data and caches result in a small lowdb JSON store for quick responses
+
+  Notes / Limitations:
+  - Holder counting here is "approximate" because we only scan a configurable recent block range to avoid huge queries.
+  - For production-grade full holder indexing you must run a proper indexer (process Transfer events from block 0 or use a provider feature / paid endpoint that lists holders) — Alchemy Enterprise + a full indexer worker is recommended.
+  - CoinGecko contract endpoint: https://api.coingecko.com/api/v3/coins/ethereum/contract/{contract_address}
+*/
+
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const { ethers } = require('ethers');
+const { Low, JSONFile } = require('lowdb');
+const { nanoid } = require('nanoid');
+const path = require('path');
+const fs = require('fs');
+
+// Config
+const PORT = process.env.PORT || 3000;
+const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY;
+const NETWORK = process.env.PROVIDER_NETWORK || 'homestead';
+const HOLDER_INDEX_BLOCK_RANGE = parseInt(process.env.HOLDER_INDEX_BLOCK_RANGE || '100000', 10);
+const CACHE_FILE = path.join(__dirname, 'db.json');
+
+if (!ALCHEMY_KEY) {
+  console.warn('⚠️  Warning: ALCHEMY_API_KEY not set. Set it in .env before running.');
+}
+
+// Setup lowdb for simple persistence
+if (!fs.existsSync(CACHE_FILE)) fs.writeFileSync(CACHE_FILE, JSON.stringify({ tokens: {} }, null, 2));
+const adapter = new JSONFile(CACHE_FILE);
+const db = new Low(adapter);
+
+async function initDB() {
+  await db.read();
+  db.data = db.data || { tokens: {} };
+  await db.write();
+}
+
+// Setup ethers provider (Alchemy)
+const provider = new ethers.providers.AlchemyProvider(NETWORK, ALCHEMY_KEY);
+
+// Minimal ERC-20 ABI for required calls
+const ERC20_ABI = [
+  'function name() view returns (string)',
+  'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)',
+  'function totalSupply() view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 value)'
+];
+
+const app = express();
+app.use(express.json());
+
+// Utility: normalize address
+function normalizeAddress(addr) {
+  try {
+    return ethers.utils.getAddress(addr);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Fetch on-chain basic info (name, symbol, decimals, totalSupply)
+async function fetchOnchainInfo(contractAddress) {
+  const contract = new ethers.Contract(contractAddress, ERC20_ABI, provider);
+  const [name, symbol, decimals, totalSupplyBN] = await Promise.all([
+    safeCall(() => contract.name()),
+    safeCall(() => contract.symbol()),
+    safeCall(() => contract.decimals()),
+    safeCall(() => contract.totalSupply())
+  ]);
+  const totalSupply = totalSupplyBN ? ethers.utils.formatUnits(totalSupplyBN, decimals || 18) : null;
+  return { name, symbol, decimals, totalSupply };
+}
+
+// Safe wrapper to avoid throw-through
+async function safeCall(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    return null;
+  }
+}
+
+// Approximate holders count by scanning Transfer events in last N blocks
+// WARNING: this is approximate and may be expensive for large ranges
+async function approximateHoldersCount(contractAddress, blockRange = HOLDER_INDEX_BLOCK_RANGE) {
+  // get latest block
+  const latest = await provider.getBlockNumber();
+  const fromBlock = Math.max(0, latest - blockRange);
+  // build filter for Transfer events
+  const iface = new ethers.utils.Interface(ERC20_ABI);
+  const transferTopic = iface.getEventTopic('Transfer');
+  const filter = {
+    address: contractAddress,
+    fromBlock,
+    toBlock: latest,
+    topics: [transferTopic]
+  };
+  try {
+    const logs = await provider.getLogs(filter);
+    // parse logs, build a simple balance map for addresses that appear in these logs
+    const balances = new Map();
+    for (const log of logs) {
+      const parsed = iface.parseLog(log);
+      const from = ethers.utils.getAddress(parsed.args.from);
+      const to = ethers.utils.getAddress(parsed.args.to);
+      const value = parsed.args.value;
+      // decrement from
+      if (from !== ethers.constants.AddressZero) {
+        const prev = balances.get(from) || ethers.BigNumber.from(0);
+        balances.set(from, prev.sub(value));
+      }
+      // increment to
+      if (to !== ethers.constants.AddressZero) {
+        const prev = balances.get(to) || ethers.BigNumber.from(0);
+        balances.set(to, prev.add(value));
+      }
+    }
+    // count non-zero balances in this map
+    let nonZero = 0;
+    for (const [addr, bn] of balances) {
+      if (!bn.isZero()) nonZero += 1;
+    }
+    // This is only *addresses touched in the window*; actual holder count requires full history.
+    return {
+      sampleWindow: { fromBlock, toBlock: latest },
+      touchedAddresses: logs.length ? (new Set(logs.map(l => JSON.parse(JSON.stringify(l.topics)))).size) : 0,
+      approximateHoldersInWindow: nonZero,
+      scannedLogs: logs.length
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// Fetch CoinGecko metadata for an ERC-20 token on Ethereum
+async function fetchCoinGecko(contractAddress) {
+  // CoinGecko endpoint for contract on Ethereum chain
+  const url = `https://api.coingecko.com/api/v3/coins/ethereum/contract/${contractAddress}`;
+  try {
+    const res = await axios.get(url, { timeout: 10000 });
+    return res.data; // contains market_data, contract_data, image, etc.
+  } catch (e) {
+    // coin not found or rate-limited
+    return null;
+  }
+}
+
+// Merge logic
+function mergeData(onchain, coingecko, holders) {
+  const merged = {
+    name: onchain.name || (coingecko && coingecko.name) || null,
+    symbol: onchain.symbol || (coingecko && coingecko.symbol) || null,
+    decimals: onchain.decimals ?? null,
+    totalSupply: onchain.totalSupply ?? (coingecko && coingecko.market_data && coingecko.market_data.total_supply) || null,
+    circulatingSupply: (coingecko && coingecko.market_data && coingecko.market_data.circulating_supply) || null,
+    price: (coingecko && coingecko.market_data && coingecko.market_data.current_price && coingecko.market_data.current_price.usd) || null,
+    marketCap: (coingecko && coingecko.market_data && coingecko.market_data.market_cap && coingecko.market_data.market_cap.usd) || null,
+    logo: (coingecko && coingecko.image && coingecko.image.small) || null,
+    holdersApprox: holders || null,
+    rawCoinGecko: coingecko ? {
+      id: coingecko.id,
+      homepage: (coingecko.links && coingecko.links.homepage && coingecko.links.homepage[0]) || null
+    } : null
+  };
+  return merged;
+}
+
+// Main endpoint: GET /api/token/:contractAddress
+app.get('/api/token/:addr', async (req, res) => {
+  const addrInput = req.params.addr;
+  const contractAddress = normalizeAddress(addrInput);
+  if (!contractAddress) return res.status(400).json({ error: 'Invalid contract address' });
+
+  await db.read();
+  db.data = db.data || { tokens: {} };
+
+  // simple cache key
+  const cacheKey = contractAddress.toLowerCase();
+  const cached = db.data.tokens[cacheKey];
+  // return cache if less than 2 minutes old
+  if (cached && Date.now() - cached._cachedAt < 1000 * 60 * 2) {
+    return res.json({ fromCache: true, data: cached.data });
+  }
+
+  // Fetch data in parallel
+  const [onchain, cg, holders] = await Promise.all([
+    fetchOnchainInfo(contractAddress),
+    fetchCoinGecko(contractAddress),
+    approximateHoldersCount(contractAddress)
+  ]);
+
+  const merged = mergeData(onchain, cg, holders);
+
+  // save to cache
+  db.data.tokens[cacheKey] = { id: nanoid(), _cachedAt: Date.now(), data: merged };
+  await db.write();
+
+  return res.json({ fromCache: false, data: merged });
+});
+
+// Simple health endpoint
+app.get('/health', (req, res) => res.json({ ok: true, provider: NETWORK }));
+
+// Start server
+(async () => {
+  await initDB();
+  app.listen(PORT, () => {
+    console.log(`🚀 OdherExplorer agent running on port ${PORT}`);
+    console.log(`GET /api/token/:contractAddress`);
+  });
+})();
+
+
+// ---------------------------
+// 4) README.md
+// ---------------------------
+/*
+# OdherExplorer Replit Agent
+
+Quick start:
+1. Create a new Replit Node.js app.
+2. Add files: package.json, server.js, .env (from .env.example), README.md
+3. Run `npm install` (Replit may do this automatically).
+4. Start the server with `npm start`.
+5. Use endpoint: GET /api/token/0x... (ERC-20 contract address)
+
+Environment variables:
+- ALCHEMY_API_KEY: required for on-chain calls
+- PROVIDER_NETWORK: network (default: homestead)
+- HOLDER_INDEX_BLOCK_RANGE: how many blocks to scan back for Transfer events (default 100000)
+- PORT: server port
+
+Notes:
+- This is a minimal, ready-to-copy example. For production you need a robust indexer for exact holders and vesting parsing.
+- To get vesting/unlock schedules, add a Tokenomics fetcher that reads a project-provided JSON or smart-contract-based vesting contracts.
+*/
